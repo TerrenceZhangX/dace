@@ -475,6 +475,7 @@ def evaluate(graph, inputs):
                     raise EvaluationError(f"{where}: invalid/duplicate node ID")
                 node_ids.add(identifier)
                 extension_ops = {'cat', 'constant_pad_nd', 'var', 'gelu', 'addmm', 'convolution', 'repeat', 'roll', 'stack', 'floor_divide', 'bitwise_not', 'bitwise_and', 'bitwise_or', 'bitwise_xor'}
+                extension_ops |= {'triu','tril','masked_fill','fill','remainder','cumsum'}
                 if not isinstance(op, str) or op not in (_OPS | extension_ops):
                     raise UnsupportedOperator(identifier, node.get("target", op), f"unsupported normalized operator {op!r}")
                 if not isinstance(node.get("args", []), list) or not isinstance(node.get("kwargs", {}), dict) or not isinstance(node.get("attributes", {}), dict):
@@ -501,6 +502,9 @@ def evaluate(graph, inputs):
                     elif op in {'repeat', 'roll', 'stack', 'floor_divide', 'bitwise_not', 'bitwise_and', 'bitwise_or', 'bitwise_xor'}:
                         from .ops_indexing import execute_indexing_extension
                         result = execute_indexing_extension(node, args, kwargs, attrs)
+                    elif op in {'triu','tril','masked_fill','fill','remainder','cumsum'}:
+                        from .ops_mask import execute_mask_extension
+                        result = execute_mask_extension(node, args, kwargs, attrs)
                     elif op == 'cat':
                         bound = _bind(args, kwargs, attrs, ['tensors','dim'], {'dim':0})
                         result = torch.cat(bound['tensors'], dim=bound['dim'])

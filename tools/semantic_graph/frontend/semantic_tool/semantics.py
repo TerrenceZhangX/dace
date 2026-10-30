@@ -165,7 +165,8 @@ class _Lowerer:
         from .ops_reduction import lower_reduction_extension
         from .ops_convolution import lower_convolution_extension
         from .ops_indexing import lower_indexing_extension
-        for extension in (lower_layout_extension, lower_reduction_extension, lower_convolution_extension, lower_indexing_extension):
+        from .ops_mask import lower_mask_extension
+        for extension in (lower_layout_extension, lower_reduction_extension, lower_convolution_extension, lower_indexing_extension, lower_mask_extension):
             result = extension(node, self.values)
             if result is not None:
                 return result

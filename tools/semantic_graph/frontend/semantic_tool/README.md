@@ -20,7 +20,7 @@ The DaCe fork is https://github.com/TerrenceZhangX/dace/tree/semantic-l1-bootstr
 
 - Full L1 inventory: **94 tasks / 1,480 workloads**. All94 reference source hashes statically reviewed; two hardcoded-CUDA sources blocked in this CPU/fake execution setup.
 - First official-shape per-task sweep: 79 captures, 36 semantic graph constructions.
-- Updated sweep after generic repairs: **83 captures, 67 complete parameterized semantic graph constructions out of 94**; 16 lowering gaps,9 capture gaps,2 source-device blocks remain.
+- Updated sweep after generic repairs: **83 captures, 72 parameterized semantic graph constructions out of 94**; 11 lowering gaps,9 capture gaps,2 source-device blocks remain. Two of the72 retain explicit data guards and conservative may-dependence, not exact value-selected dependency cones.
 - Those counts mean **capture/lowering/structure validation**, not correct complete scalar expansion or GPU execution.
 - Earlier nine-task small-shape set: all9 automatic capture→lower→scalarize→CPU interpretation passed8 seeds each, exact input-coordinate ancestor sets verified for6,310 output elements.
 - Nine-task original official workload configurations: all144 fake capture/lowering checks passed before all-L1 expansion. No numerical execution of those144.

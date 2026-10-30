@@ -17,8 +17,10 @@ class MapUnroll(transformation.SingleStateTransformation):
     containers only used in this map, they will also be replicated, as will
     nested SDFGs found within.
 
-    This transformation can be useful for forming weakly connected components
-    that will be inferred as processing elements in an FPGA kernel.
+    Only the selected scope is replicated; external access nodes, sibling
+    branches and downstream consumers are retained. Maps with nonpositive or
+    empty ranges, dynamic map inputs, GPU schedules, or scope-local streams and
+    views/references are not supported by this transformation.
     """
 
     map_entry = transformation.PatternNode(nodes.MapEntry)
@@ -32,23 +34,43 @@ class MapUnroll(transformation.SingleStateTransformation):
         # Must be top-level map
         if graph.scope_dict()[map_entry] is not None:
             return False
-        # All map ranges must be constant
+        # TrivialMapElimination cannot remove GPU or dynamically-fed scopes.
+        from dace import dtypes
+        if map_entry.map.schedule in dtypes.GPU_SCHEDULES:
+            return False
+        if any(not e.data.is_empty() and (e.dst_conn is None or not e.dst_conn.startswith("IN_"))
+               for e in graph.in_edges(map_entry)):
+            return False
+        # Empty-map elimination needs separate boundary/lifetime handling.
         try:
             for begin, end, step in map_entry.map.range:
-                symbolic.evaluate(begin, sdfg.constants)
-                symbolic.evaluate(end, sdfg.constants)
-                symbolic.evaluate(step, sdfg.constants)
-        except TypeError:
+                values = [symbolic.evaluate(v, sdfg.constants) for v in (begin, end, step)]
+                if any(int(v) != v for v in values):
+                    return False
+                begin, end, step = map(int, values)
+                if step <= 0 or begin > end:
+                    return False
+        except (TypeError, ValueError, OverflowError):
             return False
+        scope = graph.scope_subgraph(map_entry)
+        for name in sdutil.local_transients(sdfg, scope, entry_node=map_entry, include_nested=True):
+            if isinstance(sdfg.arrays[name], (dt.Stream, dt.View, dt.Reference)):
+                return False
         return True
 
     def apply(self, state: SDFGState, sdfg: SDFG):
         from dace.transformation.dataflow import TrivialMapElimination
 
         map_entry = self.map_entry
+        if not self.can_be_applied(state, 0, sdfg):
+            raise ValueError("MapUnroll requires a supported top-level constant nonempty map")
 
-        # Collect all nodes in this weakly connected component
-        subgraph = sdutil.weakly_connected_component(state, map_entry)
+        # Copy only this scope. External access nodes and downstream consumers
+        # can serve other branches and must neither be copied nor removed.
+        subgraph = state.scope_subgraph(map_entry)
+        map_exit = state.exit_node(map_entry)
+        internal_edges = list(subgraph.edges())
+        boundary_edges = list(state.in_edges(map_entry)) + list(state.out_edges(map_exit))
 
         # Save nested SDFGs to JSON, then deserialize them for every copy we
         # need to make
@@ -70,12 +92,15 @@ class MapUnroll(transformation.SingleStateTransformation):
             begin = symbolic.evaluate(r[0], sdfg.constants)
             end = symbolic.evaluate(r[1], sdfg.constants)
             step = symbolic.evaluate(r[2], sdfg.constants)
-            end += step  # Make non-inclusive
-            constant_ranges.append(range(begin, end, step))
+            # Inclusive bounds may be unaligned with the step.
+            end += 1 if step > 0 else -1
+            constant_ranges.append(range(int(begin), int(end), int(step)))
         index_tuples = itertools.product(*constant_ranges)
         for t in index_tuples:
             suffix = "_" + "_".join(map(str, t))
             node_to_unrolled = {}
+            local_names = {name: sdfg.add_datadesc(name + suffix, copy.deepcopy(sdfg.arrays[name]),
+                                                 find_new_name=True) for name in local_memories}
             # Copy all nodes
             for node in subgraph:
                 if isinstance(node, nodes.NestedSDFG):
@@ -104,22 +129,16 @@ class MapUnroll(transformation.SingleStateTransformation):
                         # Fix the map bounds to only this iteration
                         unrolled_node.map.range = [(i, i, 1) for i in t]
                     if isinstance(node, nodes.AccessNode) and node.data in local_memories:
-                        # If this is a local memory only used in this subgraph,
-                        # we need to replicate it for each new subgraph
-                        unrolled_name = node.data + suffix
-                        if unrolled_name not in sdfg.arrays:
-                            unrolled_desc = copy.deepcopy(sdfg.arrays[node.data])
-                            sdfg.add_datadesc(unrolled_name, unrolled_desc)
-                        unrolled_node.data = unrolled_name
+                        unrolled_node.data = local_names[node.data]
                 state.add_node(unrolled_node)
                 node_to_unrolled[node] = unrolled_node  # Remember mapping
-            # Copy all edges
-            for src, src_conn, dst, dst_conn, memlet in subgraph.edges():
-                src = node_to_unrolled[src]
-                dst = node_to_unrolled[dst]
+            # Reconnect boundary edges to their original external endpoints.
+            for src, src_conn, dst, dst_conn, memlet in internal_edges + boundary_edges:
+                src = node_to_unrolled.get(src, src)
+                dst = node_to_unrolled.get(dst, dst)
                 memlet = copy.deepcopy(memlet)
                 if memlet.data in local_memories:
-                    memlet.data = memlet.data + suffix
+                    memlet.data = local_names[memlet.data]
                 state.add_edge(src, src_conn, dst, dst_conn, memlet)
             # Eliminate the now trivial map
             TrivialMapElimination.apply_to(

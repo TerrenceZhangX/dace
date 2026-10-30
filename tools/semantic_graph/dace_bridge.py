@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 from copy import deepcopy
 import itertools
 import json
@@ -29,12 +30,12 @@ DTYPES = {"float32": dace.float32, "float64": dace.float64, "float16": dace.floa
           "bool": dace.bool_}
 FLOATS = {"float16", "bfloat16", "float32", "float64"}
 POINTWISE = {"add", "sub", "rsub", "mul", "div", "pow", "tanh", "exp", "sigmoid",
-             "sqrt", "rsqrt", "neg", "maximum"}
+             "sqrt", "rsqrt", "neg", "maximum", "gelu"}
 LAYOUT = {"reshape", "view", "permute", "transpose", "expand", "slice", "select",
           "clone", "contiguous", "alias", "unsqueeze", "squeeze", "cast", "copy"}
 REDUCE = {"sum", "mean", "mm", "bmm", "matmul", "amax"}
 UPDATES = {"slice_scatter", "select_scatter"}
-OPS = POINTWISE | LAYOUT | REDUCE | UPDATES | {"zeros_like", "softmax"}
+OPS = POINTWISE | LAYOUT | REDUCE | UPDATES | {"zeros_like", "softmax", "cat", "constant_pad_nd", "addmm"}
 _BIN = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
         ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod}
 _CMP = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt,
@@ -163,6 +164,10 @@ def validate_graph(graph):
                 raise BridgeUnsupported("semantic read rank mismatch")
             for expr in read["indices"]: _safe_index(expr, names)
             if "guard" in read: _safe_index(read["guard"], names)
+        for region in sem.get("constant_regions", []):
+            if not isinstance(region, dict) or "guard" not in region:
+                raise BridgeUnsupported("invalid literal region")
+            _safe_index(region["guard"], names)
         add(outputs[0])
     for ref in refs(graph.get("outputs")):
         if ref not in table: raise BridgeUnsupported("unknown output reference")
@@ -192,6 +197,16 @@ def _expr(node, connector_by_ref, table, finite_only):
         return _cast(expression, dtype)
     a = value(args[0])
     b = value(args[1]) if len(args) > 1 else None
+    if op == "gelu":
+        mode = attrs.get("approximate", node.get("kwargs", {}).get("approximate", "none"))
+        if mode not in ("none", "tanh"):
+            raise BridgeUnsupported("gelu approximate must be none or tanh")
+        half, one = _cast("0.5", dtype), _cast("1", dtype)
+        if mode == "none":
+            return f"({half} * {a} * ({one} + erf({a} * {_cast(repr(math.sqrt(0.5)), dtype)})))"
+        coefficient = _cast("0.044715", dtype)
+        scale = _cast(repr(math.sqrt(2 / math.pi)), dtype)
+        return f"({half} * {a} * ({one} + tanh({scale} * ({a} + {coefficient} * ({a} * {a} * {a})))))"
     if op in {"add", "sub", "rsub"}:
         alpha = value(attrs.get("alpha", 1))
         return {"add": f"({a} + {alpha} * {b})", "sub": f"({a} - {alpha} * {b})",
@@ -262,6 +277,107 @@ def lower_to_sdfg(graph, name="semantic_bridge", *, finite_only=False, annotatio
         label = f"op{number}"
         manifest["nodes"].append({"node_id": node["id"], "op": op, "tasklet_prefix": label,
                                   "output": out_array, "output_value": out["id"]})
+        if op == "cat":
+            axis = attrs.get("dim")
+            segments = attrs.get("segments")
+            if type(axis) is not int or not 0 <= axis < len(domain) or not isinstance(segments, list):
+                raise BridgeUnsupported("cat needs normalized dim and segments")
+            offset = 0
+            for j, segment in enumerate(segments):
+                identifier = segment.get("value")
+                if identifier not in table or table[identifier].get("kind") == "scalar":
+                    raise BridgeUnsupported("cat segment requires tensor source")
+                shape = table[identifier]["shape"]
+                if len(shape) != len(domain) or table[identifier]["dtype"] != dtype:
+                    raise BridgeUnsupported("cat requires same-rank/same-dtype segments")
+                if any(n != out["shape"][k] for k, n in enumerate(shape) if k != axis):
+                    raise BridgeUnsupported("cat non-concatenated extents disagree")
+                if segment.get("start") != offset or segment.get("end") != offset + shape[axis]:
+                    raise BridgeUnsupported("cat segment gap, overlap, or wrong extent")
+                part = deepcopy(domain); part[axis]["extent"] = shape[axis]
+                output_coords = list(indices); output_coords[axis] = f"({indices[axis]}+{offset})"
+                emit(label + f"_segment{j}", part, {"x": mem(names[identifier], indices)}, "x",
+                     out_array, output_coords, dtype)
+                offset += shape[axis]
+            if offset != out["shape"][axis]: raise BridgeUnsupported("cat segments do not cover output")
+            continue
+        if op == "constant_pad_nd":
+            source_id = node["args"][0]["ref"]
+            source_shape = table[source_id]["shape"]
+            before, after = attrs.get("pad_before"), attrs.get("pad_after")
+            fill = attrs.get("fill_value", 0)
+            if (not isinstance(before, list) or not isinstance(after, list) or
+                    len(before) != len(domain) or len(after) != len(domain) or
+                    any(type(v) is not int for v in before + after)):
+                raise BridgeUnsupported("padding needs normalized before/after integers")
+            if len(source_shape) != len(domain) or table[source_id]["dtype"] != dtype:
+                raise BridgeUnsupported("padding cannot change rank or dtype")
+            if any(n + a + b != m or n + min(a, 0) + min(b, 0) < 0
+                   for n, a, b, m in zip(source_shape, before, after, out["shape"])):
+                raise BridgeUnsupported("invalid padding/cropping extents")
+            if type(fill) not in (int, float, bool) or not math.isfinite(fill):
+                raise BridgeUnsupported("padding currently requires finite numeric fill")
+            if dtype in {"int32", "int64"} and not -(2 ** (int(dtype[3:]) - 1)) <= fill < 2 ** (int(dtype[3:]) - 1):
+                raise BridgeUnsupported("padding fill outside integer range")
+            # At most 2*rank exterior slabs and one interior rectangle. Prefix
+            # dimensions are progressively restricted so regions never overlap.
+            lower = [max(0, p) for p in before]
+            upper = [min(m, p + n) for m, p, n in zip(out["shape"], before, source_shape)]
+            lower = [min(m, x) for m, x in zip(out["shape"], lower)]
+            upper = [max(l, u) for l, u in zip(lower, upper)]
+            bounds = [[0, n] for n in out["shape"]]
+            def pad_region(suffix, region, literal):
+                part = deepcopy(domain)
+                for j, (lo, hi) in enumerate(region): part[j]["extent"] = hi - lo
+                coords = [f"({v}+{region[j][0]})" for j, v in enumerate(indices)]
+                reads = {} if literal else {"x": mem(names[source_id], [f"({v}-({before[j]}))" for j, v in enumerate(coords)])}
+                emit(label + suffix, part, reads, repr(fill) if literal else "x", out_array, coords, dtype)
+            for axis in range(len(domain)):
+                for side, lo, hi in (("low", bounds[axis][0], lower[axis]), ("high", upper[axis], bounds[axis][1])):
+                    box = deepcopy(bounds); box[axis] = [lo, hi]
+                    pad_region(f"_fill{axis}_{side}", box, True)
+                bounds[axis] = [lower[axis], upper[axis]]
+            pad_region("_interior", bounds, False)
+            continue
+        if op == "addmm":
+            args = node["args"]
+            if len(args) != 3 or dtype not in FLOATS or len(domain) != 2:
+                raise BridgeUnsupported("addmm requires bias, rank-2 matrices, and floating output")
+            bias_id, left_id, right_id = (arg["ref"] for arg in args)
+            left, right, bias = (table[k]["shape"] for k in (left_id, right_id, bias_id))
+            if len(left) != 2 or len(right) != 2 or left[1] != right[0] or out["shape"] != [left[0], right[1]]:
+                raise BridgeUnsupported("addmm matrix shape mismatch")
+            if any(table[k]["dtype"] != dtype for k in (bias_id, left_id, right_id)):
+                raise BridgeUnsupported("addmm operand dtypes must match")
+            if len(bias) > 2 or any(n != 1 and n != out["shape"][2-len(bias)+j] for j, n in enumerate(bias)):
+                raise BridgeUnsupported("addmm bias cannot broadcast to output")
+            alpha, beta, k = attrs.get("alpha", 1), attrs.get("beta", 1), left[1]
+            if type(beta) not in (int, float) or not math.isfinite(beta):
+                raise BridgeUnsupported("addmm beta must be finite")
+            if k and (type(alpha) not in (int, float) or not math.isfinite(alpha)):
+                raise BridgeUnsupported("nonempty addmm alpha must be finite")
+            comp = "float64" if dtype == "float64" else "float32"
+            final_inputs = {}
+            final = _cast("0", comp)
+            if k:
+                accum = f"accumulator{number}"
+                temporary(accum, out["shape"], comp)
+                emit(label + "_init", domain, {}, "0", accum, indices, comp)
+                reduction_domain = domain + [{"var": "r0", "extent": k}]
+                emit(label + "_products", reduction_domain,
+                     {"a": mem(names[left_id], [indices[0], "r0"]), "b": mem(names[right_id], ["r0", indices[1]])},
+                     f"({_cast('a', comp)} * {_cast('b', comp)})", accum, indices, comp, "lambda x, y: x + y")
+                final_inputs["acc"] = mem(accum, indices)
+                final = f"({_cast(repr(alpha), comp)} * acc)"
+            if beta != 0:
+                bias_indices = ["0" if n == 1 else indices[2-len(bias)+j] for j, n in enumerate(bias)]
+                final_inputs["bias"] = mem(names[bias_id], bias_indices)
+                bias_term = f"({_cast(repr(beta), comp)} * {_cast('bias', comp)})"
+                final = f"({final} + {bias_term})" if k else bias_term
+            # Bias is loaded and multiplied once per output, never once per K.
+            # beta=0 omits its read entirely; K=0 never multiplies alpha by zero.
+            emit(label + "_finish", domain, final_inputs, final, out_array, indices, dtype)
+            continue
         if op in UPDATES:
             # Disjoint rectangles implement the semantic guards. No unselected
             # source value is loaded, even at coordinates outside its bounds.
@@ -384,6 +500,63 @@ def _coordinates(shape):
     return itertools.product(*(range(x) for x in shape))
 
 
+def _tasklet_operation_counts(tasklet):
+    """Static tasklet arithmetic occurrences, not hardware FLOPs or numeric proof.
+
+    Count calls/casts separately and exclude coordinate expressions in memlets.
+    These bridge tasklets have no arithmetic control-flow branches except finite
+    maximum's conditional selection, whose arms contain casts only.
+    """
+    counts = Counter()
+    names = {ast.Add: "add", ast.Sub: "sub", ast.Mult: "mul", ast.Div: "div",
+             ast.Pow: "pow", ast.FloorDiv: "floor_div", ast.Mod: "mod"}
+    for node in ast.walk(ast.parse(tasklet.code.as_string)):
+        if isinstance(node, ast.BinOp): counts[names.get(type(node.op), type(node.op).__name__)] += 1
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub): counts["neg"] += 1
+        elif isinstance(node, ast.Compare): counts["compare"] += len(node.ops)
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "dace":
+                counts["cast:" + node.func.attr] += 1
+            elif isinstance(node.func, ast.Name): counts["call:" + node.func.id] += 1
+            else: raise BridgeUnsupported("unexpected tasklet call in arithmetic counter")
+    return counts
+
+
+def _native_operation_counts(sdfg, manifest, mapped):
+    totals, per_node, per_tasklet, reads = Counter(), {}, {}, Counter()
+    for state in sdfg.states():
+        scope = state.scope_dict()
+        for tasklet in state.nodes():
+            if not isinstance(tasklet, dace.nodes.Tasklet): continue
+            multiplicity = 1
+            parent = scope[tasklet]
+            while parent is not None:
+                if not mapped: raise BridgeUnsupported("unrolled arithmetic counter found map")
+                multiplicity *= math.prod(int((b-a)//c+1) for a,b,c in parent.map.range.ranges)
+                parent = scope[parent]
+            counts = _tasklet_operation_counts(tasklet)
+            for edge in state.out_edges(tasklet):
+                if edge.data.wcr is not None:
+                    if "+" in edge.data.wcr: counts["wcr:sum"] += 1
+                    elif "max" in edge.data.wcr: counts["wcr:max"] += 1
+                    else: raise BridgeUnsupported("unknown WCR in arithmetic counter")
+            prefix = tasklet.label.split("_")[0]
+            per_node.setdefault(prefix, Counter())
+            # MapUnroll may suffix tasklet labels with numeric coordinates.
+            label = tasklet.label
+            while label.rsplit("_", 1)[-1].lstrip("-").isdigit(): label = label.rsplit("_", 1)[0]
+            per_tasklet.setdefault(label, Counter())
+            for kind, number in counts.items():
+                value = number * multiplicity
+                totals[kind] += value; per_node[prefix][kind] += value; per_tasklet[label][kind] += value
+            for edge in state.in_edges(tasklet):
+                value = manifest["array_to_value"].get(edge.data.data)
+                if value is not None: reads[(prefix, value)] += multiplicity
+    return {"totals": dict(totals), "per_node": {k:dict(v) for k,v in per_node.items()},
+            "per_tasklet": {k:dict(v) for k,v in per_tasklet.items()},
+            "tensor_read_occurrences": {k+":"+v:n for (k,v),n in reads.items()}}
+
+
 def unroll_and_check(graph, sdfg, manifest, *, max_instances=20000, max_read_checks=200000):
     """Native MapUnroll + exact immediate semantic input cone verification.
 
@@ -398,9 +571,13 @@ def unroll_and_check(graph, sdfg, manifest, *, max_instances=20000, max_read_che
             if isinstance(n, dace.nodes.MapEntry):
                 estimate += math.prod(int((b - a) // c + 1) for a, b, c in n.map.range.ranges)
     if estimate > max_instances: raise BridgeUnsupported(f"unroll budget exceeded: {estimate} > {max_instances}")
+    mapped_operations = _native_operation_counts(sdfg, manifest, mapped=True)
     expanded = deepcopy(sdfg)
     applications = expanded.apply_transformations_repeated(MapUnroll, validate=True, validate_all=True)
     expanded.validate()
+    unrolled_operations = _native_operation_counts(expanded, manifest, mapped=False)
+    if mapped_operations != unrolled_operations:
+        raise BridgeUnsupported("native unroll changed arithmetic or tensor-read occurrence counts")
     expected, checks = {}, 0
     for node in graph["nodes"]:
         sem = node["semantics"]
@@ -413,9 +590,15 @@ def unroll_and_check(graph, sdfg, manifest, *, max_instances=20000, max_read_che
         for coord in _coordinates([v["extent"] for v in variables]):
             env = dict(zip((v["var"] for v in variables), coord))
             key = (node["outputs"][0]["id"], tuple(env[v["var"]] for v in sem["domain"]))
-            for read in sem.get("reads", []):
+            selected = [read for read in sem.get("reads", []) if "guard" not in read or index_eval(read["guard"], env)]
+            if node["op"] == "constant_pad_nd":
+                literals = [r for r in sem.get("constant_regions", []) if index_eval(r["guard"], env)]
+                if len(selected) + len(literals) != 1:
+                    raise BridgeUnsupported("padding guards must partition into exactly one read or literal")
+                if literals and literals[0].get("value") != node["attributes"].get("fill_value"):
+                    raise BridgeUnsupported("padding literal disagrees with fill_value")
+            for read in selected:
                 if table[read["value"]].get("kind") == "scalar": continue
-                if "guard" in read and not index_eval(read["guard"], env): continue
                 idx = tuple(index_eval(x, env) for x in read["indices"])
                 shape = table[read["value"]]["shape"]
                 if any(type(i) is not int or i < 0 or i >= n for i, n in zip(idx, shape)):
@@ -465,7 +648,9 @@ def unroll_and_check(graph, sdfg, manifest, *, max_instances=20000, max_read_che
     return expanded, {"pass": True, "map_unroll_applications": applications,
                       "tasklets_unrolled": tasklets, "semantic_scalar_outputs": len(expected),
                       "semantic_read_checks": checks,
-                      "scope": "native memlet immediate input cone sets; not FP order or native numerical execution"}
+                      "arithmetic_occurrences": unrolled_operations,
+                      "arithmetic_count_preservation": True,
+                      "scope": "native immediate input cone sets and static tasklet arithmetic/read occurrence preservation; not FP order, hardware FLOPs, or native numeric execution"}
 
 
 def main():

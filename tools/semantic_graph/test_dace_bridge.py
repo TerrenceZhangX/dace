@@ -132,6 +132,81 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeUnsupported, "cone mismatch"):
             unroll_and_check(f.graph, sdfg, manifest)
 
+    def test_cat_repeated_segments_and_empty_skip(self):
+        f = Fixture(a=([2, 2], "float32"), empty=([0], "float32"), b=([2, 1], "float32"))
+        segments = [{"value": "a", "start": 0, "end": 2}, {"value": "b", "start": 2, "end": 3},
+                    {"value": "a", "start": 3, "end": 5}]
+        f.node("cat", [[ref("a"), ref("empty"), ref("b"), ref("a")], 1], [2, 5], "float32",
+               [read("a", ["i0", "i1"], "i1 < 2"), read("b", ["i0", "i1-2"], "i1 >= 2 and i1 < 3"),
+                read("a", ["i0", "i1-3"], "i1 >= 3")], {"dim": 1, "segments": segments})
+        _, result, _ = self.check(f)
+        counts = result["arithmetic_occurrences"]
+        self.assertEqual(counts["tensor_read_occurrences"], {"op0:a": 8, "op0:b": 2})
+        self.assertEqual(counts["totals"], {"cast:float32": 10})
+
+    def test_padding_literal_regions_negative_crop(self):
+        f = Fixture(x=([3, 4], "bfloat16"))
+        guard = "i0 >= 1 and i0 < 4 and i1 < 3"
+        f.node("constant_pad_nd", [ref("x"), [-1, 2, 1, 0], 0.003], [4, 5], "bfloat16",
+               [read("x", ["i0-1", "i1+1"], guard)],
+               {"pad_before": [1, -1], "pad_after": [0, 2], "fill_value": 0.003})
+        f.graph["nodes"][-1]["semantics"]["constant_regions"] = [{"guard": f"not ({guard})", "value": 0.003}]
+        code, result, _ = self.check(f)
+        self.assertEqual(result["arithmetic_occurrences"]["tensor_read_occurrences"], {"op0:x": 9})
+        self.assertEqual(result["arithmetic_occurrences"]["totals"], {"cast:bfloat16": 20})
+        self.assertIn("dace::bfloat16(0.003)", code)
+
+    def test_addmm_bias_once_and_alpha_beta_once(self):
+        f = Fixture(bias=([3], "bfloat16"), a=([2, 4], "bfloat16"), b=([4, 3], "bfloat16"))
+        f.node("addmm", [ref("bias"), ref("a"), ref("b")], [2, 3], "bfloat16",
+               [read("a", ["i0", "r0"]), read("b", ["r0", "i1"]), read("bias", ["i1"])],
+               {"alpha": 0.25, "beta": 2.0}, reduction=reduction(4, "sum-of-products"))
+        _, result, _ = self.check(f)
+        counts = result["arithmetic_occurrences"]
+        self.assertEqual(counts["tensor_read_occurrences"], {"op0:a": 24, "op0:b": 24, "op0:bias": 6})
+        self.assertEqual(counts["totals"]["mul"], 36)  # 24 products + 6 alpha + 6 beta
+        self.assertEqual(counts["totals"]["wcr:sum"], 24)
+        self.assertEqual(counts["totals"]["add"], 6)
+        self.assertEqual(counts["per_tasklet"]["op0_finish"]["mul"], 12)
+
+    def test_addmm_zero_beta_and_empty_contraction(self):
+        for k, beta in ((3, 0), (0, 2), (0, 0)):
+            with self.subTest(k=k, beta=beta):
+                f = Fixture(bias=([2, 2], "float32"), a=([2, k], "float32"), b=([k, 2], "float32"))
+                reads = [read("a", ["i0", "r0"]), read("b", ["r0", "i1"])] if k else []
+                if beta: reads.append(read("bias", ["i0", "i1"]))
+                f.node("addmm", [ref("bias"), ref("a"), ref("b")], [2, 2], "float32", reads,
+                       {"alpha": 0.5 if k else float("inf"), "beta": beta},
+                       reduction=reduction(k, "sum-of-products") if k else None)
+                _, result, _ = self.check(f)
+                counts = result["arithmetic_occurrences"]
+                self.assertEqual(counts["tensor_read_occurrences"].get("op0:bias", 0), 4 if beta else 0)
+                self.assertEqual(counts["totals"].get("wcr:sum", 0), 4*k)
+                if not k:
+                    self.assertEqual(counts["totals"].get("mul", 0), 4 if beta else 0)
+
+    def test_gelu_erf_and_tanh_arithmetic_counts(self):
+        for mode, special, multiplications, additions in (("none", "erf", 3, 1), ("tanh", "tanh", 6, 2)):
+            with self.subTest(mode=mode):
+                f = Fixture(x=([2, 3], "bfloat16"))
+                f.node("gelu", [ref("x")], [2, 3], "bfloat16", [read("x", ["i0", "i1"])], {"approximate": mode})
+                code, result, _ = self.check(f)
+                counts = result["arithmetic_occurrences"]["totals"]
+                self.assertEqual(counts["call:" + special], 6)
+                self.assertEqual(counts["mul"], 6*multiplications)
+                self.assertEqual(counts["add"], 6*additions)
+                self.assertEqual(counts["cast:bfloat16"], 6)
+                self.assertIn(special, code)
+
+    def test_unsupported_gelu_and_nonfinite_padding(self):
+        f = Fixture(x=([2], "float32"))
+        f.node("gelu", [ref("x")], [2], "float32", [read("x", ["i0"])], {"approximate": "fast"})
+        with self.assertRaisesRegex(BridgeUnsupported, "approximate"):
+            lower_to_sdfg(f.graph)
+        f.graph["nodes"][0].update(op="constant_pad_nd", attributes={"pad_before": [0], "pad_after": [0], "fill_value": float("inf")})
+        with self.assertRaisesRegex(BridgeUnsupported, "finite"):
+            lower_to_sdfg(f.graph)
+
     def test_unroll_budget(self):
         f = Fixture(x=([4], "float32"))
         f.node("clone", [ref("x")], [4], "float32", [read("x", ["i0"])])

@@ -27,15 +27,19 @@ A trusted producer may pass `annotation_verifier=producer_verify_function` to `l
 ## Supported baseline
 
 - Floating pointwise add/sub/rsub/mul/div/pow, neg, exp/tanh/sigmoid/sqrt/rsqrt.
+- GELU with explicit `approximate="none"` (erf) or `"tanh"` expressions, FP32 opmath for low-precision storage, and one output rounding boundary. Unknown approximation modes are rejected.
 - Floating maximum and amax under the explicit `finite_only=True` policy.
 - Casts, packed logical layout maps (reshape/view/transpose/permute/expand/select/slice), clone/alias/copy, squeeze/unsqueeze.
 - Sum/mean and matrix/batched contractions from explicit reduction index maps.
+- Floating addmm: matrix-product WCR followed by one alpha scaling and one broadcast bias beta scaling/add per output. `beta=0` omits bias reads entirely. Empty K omits all matrix reads and does not compute `alpha*0`, preserving the producer’s zero-contraction convention.
 - Stable functional softmax under `finite_only=True`: row maximum → subtract/exp → sum → divide.
 - `zeros_like` with metadata-only input dependencies.
+- Cat with normalized disjoint segments, including repeated tensor sources and empty segments.
+- Constant padding/cropping with at most `2*rank+1` nonoverlapping rectangles. Literal padding has no tensor value dependency; negative padding crops exact source coordinates. Fill must currently be finite, with checked integer range.
 - Functional select/scatter and positive-step slice/scatter. Disjoint prefix/suffix/gap/update maps ensure an unselected source index is never loaded. Old destination elements remain dependencies exactly outside the updated region.
 - FP16 and BF16 storage with FP32 pointwise opmath and reduction accumulators, explicit casts at semantic node output boundaries. Wrapped scalar literals are not pre-rounded to the low-precision storage type.
 
-All unsupported operations fail closed. Examples include tensor-constant initialization, generic factories other than zeros_like, integer arithmetic/reduction promotion and overflow, rounded integer division, empty mean, scalar/empty-axis softmax, complex arithmetic, and unknown operators.
+All unsupported operations fail closed. Examples include variance and convolution (not added by this incremental bridge change), tensor-constant initialization, generic factories other than zeros_like, integer arithmetic/reduction promotion and overflow, rounded integer division, empty mean, scalar/empty-axis softmax, complex arithmetic, and unknown operators.
 
 ## Important semantic boundaries
 
@@ -53,10 +57,12 @@ Arrays use **packed logical tensor values**; source physical strides/storage off
 
 The bridge deliberately selects a conservative CPU execution schedule: sequential maps in a chain of SSA-operation states, with extra reduction initialization/finalization states. Those state barriers are not claimed to exist in the source semantic graph and do not establish optimal span. Later DaCe optimization/scheduling is separate from frontend dependency semantics.
 
-`unroll_and_check` tracks actual native tasklet memlet dependencies through temporary reduction/softmax arrays, stopping at each semantic SSA output boundary. It compares each semantic output's immediate tensor-input-coordinate **set** with the supplied `reads`/reduction/guard rules. This includes whole-row softmax and exclusive SSA scatter dependencies. It is not a test of arithmetic occurrence multiplicity, scalar values, FP order, compiled code, or source authenticity.
+`unroll_and_check` tracks actual native tasklet memlet dependencies through temporary reduction/softmax arrays, stopping at each semantic SSA output boundary. It compares each semantic output's immediate tensor-input-coordinate **set** with the supplied `reads`/reduction/guard rules. This includes whole-row softmax, exclusive SSA scatter dependencies, cat segments, literal padding, and addmm final bias dependencies.
+
+The checker also counts static tasklet AST arithmetic occurrences (`add`, `mul`, etc.), casts, special-function calls, WCR contributions, and per-semantic-node tensor read occurrences before and after native MapUnroll. Mapped counts are weighted by exact map cardinality and must match the unrolled graph. Generic tests separately assert hand-calculated counts: addmm bias must be read once per output rather than once per K, and each GELU output must execute exactly one erf/tanh call. These are explicit implementation-operation counts, **not hardware FLOPs, optimal arithmetic work, numeric equivalence, or source authenticity**. A count-preserving incorrect formula still requires separate numerical validation.
 
 ### Verification status
 
-Initial development executed 11 generic unittest methods successfully against DaCe 2.0.0b1. Successful cases exercise native SDFG validation, CPU code generation, native `MapUnroll`, and exact input-coordinate dependency checking; negative cases exercise unsupported operations, hostile index syntax, guard tampering, and expansion caps. Softmax tests include different axes/ranks and BF16/FP64 storage.
+The expanded suite executed 17 generic unittest methods successfully against DaCe 2.0.0b1 (including subcases for GELU modes, empty K, zero beta, and different softmax axes). Successful cases exercise native SDFG validation, CPU code generation, native `MapUnroll`, exact input-coordinate dependency checking, and arithmetic/read-occurrence preservation; negative cases exercise unsupported operations, hostile index syntax, guard tampering, and expansion caps. Softmax tests include different axes/ranks and BF16/FP64 storage.
 
 No native compilation or native numerical execution is implied by these tests. Code generation is not compilation. Run a separate authorized C++/GPU-toolchain numerical acceptance suite before making execution-equivalence or performance claims.
